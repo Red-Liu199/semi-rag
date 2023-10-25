@@ -385,30 +385,17 @@ class UnsupervisedDataset(torch.utils.data.Dataset):
         return d
 
     def collate_fn(self, batch):
-        prior_input_ids = [x["prior_input_ids"] for x in batch]
-        prior_input_ids = torch.tensor(
-            pad_ids(prior_input_ids, self.prior_dataset.pad))
-
-        posterior_input_ids = [x["posterior_input_ids"] for x in batch]
-        posterior_input_ids = torch.tensor(
-            pad_ids(posterior_input_ids, self.posterior_dataset.pad))
-
-        posterior_token_type_ids = [
-            x["posterior_token_type_ids"] for x in batch]
-        posterior_token_type_ids = torch.tensor(
-            pad_ids(posterior_token_type_ids, self.posterior_dataset.pad))
-
-        # Needs document so these ids are incomplete
-        decoder_input_ids = [x["decoder_input_ids"] for x in batch]
-        decoder_response_ids = [x["decoder_response_ids"] for x in batch]
-
-        doc_ids = [x["doc_id"] for x in batch]
-        q_ids = [x["qid"] for x in batch]
-
-        has_cannot_answer = [x["has_cannot_answer"] for x in batch]
-        has_cannot_answer = torch.tensor(has_cannot_answer)
-
-        return prior_input_ids, posterior_input_ids, posterior_token_type_ids, decoder_input_ids, decoder_response_ids, doc_ids, q_ids, has_cannot_answer
+        d = {}
+        for key in batch[0]:
+            if key in ['decoder_input_ids', 'decoder_response_ids', 'doc_id', 'qid']:
+                d[key] = [x[key] for x in batch]
+            elif key=='has_cannot_answer':
+                d[key] = torch.tensor([x[key] for x in batch])
+            else:
+                ids = [x[key] for x in batch]
+                pad_id = self.prior_dataset.pad if 'prior' in key else self.posterior_dataset.pad
+                d[key] = torch.tensor(pad_ids(ids, pad_id))
+        return d
 
     def __len__(self):
         return len(self.prior_dataset)

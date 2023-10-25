@@ -1,4 +1,5 @@
 import json
+from json import decoder
 import logging
 import os
 from itertools import chain
@@ -664,19 +665,19 @@ class UnsupervisedModel(nn.Module):
         for i in range(B):
             result = []
             for j in range(n):
-                result.append(documents[i][j])
+                result.append(documents[i][indices[i][j]])
             results.append(result)
         return results
 
     def forward(self, batch):
-        (prior_input_ids,
-         posterior_input_ids,
-         posterior_token_type_ids,
-         decoder_input_ids,
-         decoder_response_ids,
-         doc_ids,
-         q_ids,
-         has_cannot_answer) = batch
+        prior_input_ids = batch['prior_input_ids']
+        posterior_input_ids = batch['posterior_input_ids']
+        posterior_token_type_ids = batch['posterior_token_type_ids']
+        decoder_input_ids = batch['decoder_input_ids']
+        decoder_response_ids = batch['decoder_response_ids']
+        doc_ids = batch['doc_id']
+        q_ids = batch['qid']
+        has_cannot_answer = batch['has_cannot_answer']
 
         has_cannot_answer = has_cannot_answer.cuda()
         log_info = {}
@@ -914,6 +915,7 @@ class UnsupervisedModel(nn.Module):
 
             # calculate topk recall
             batch_size = prior_input_ids.size(0)
+            hidden_size = posterior_topk_documents_embeddings.size(-1)
             posterior_recall = 0
             prior_recall = 0
             for i in range(batch_size):
@@ -931,7 +933,8 @@ class UnsupervisedModel(nn.Module):
             accept_rate = 0
             with torch.no_grad():
                 # first sample independent z and feed them into the decoder
-                z_ids = torch.multinomial(topk_probs, self.args.mis_step) # (B, n)
+                z_ids = torch.multinomial(topk_probs, self.args.mis_step, replacement=True) # (B, n)
+                final_z_ids = z_ids.clone() # n ids of z in the MIS chain
                 doc_text = self.SelectDoc(posterior_topk_documents_text, z_ids)
                 input_ids, labels, _ = self.decoder_model._prepare_inputs(decoder_input_ids, decoder_response_ids, doc_text) # (B, n, L)
                 input_ids, labels = input_ids.view(-1, input_ids.size(-1)), labels.view(-1, labels.size(-1)) # (B*n, L)
@@ -947,8 +950,26 @@ class UnsupervisedModel(nn.Module):
 
                     # decoder prob
                     nl_lm_prob = neg_log_lm_probs[:, i] # (B, )
-                    if i==0: # directly accept
-                        doc_idx = z_idx.clone() # (B, 1)
+                    if i==0:
+                        # compare with samples from last epoch
+                        if self.args.jsa_cache and 'cached_ids' in batch:
+                            cached_ids = batch['cached_ids'].cuda() # (B,1)
+                            doc_idx = cached_ids.clone()
+                            pv_prior_prob, pv_nl_lm_prob, pv_posterior_prob = batch['cached_probs'] # (B,)
+                            pv_prior_prob, pv_nl_lm_prob, pv_posterior_prob = \
+                                pv_prior_prob.cuda(), pv_nl_lm_prob.cuda(), pv_posterior_prob.cuda()
+                            lm_prob_ratio = torch.exp(pv_nl_lm_prob-nl_lm_prob)
+                            accept_probs = lm_prob_ratio*prior_prob*pv_posterior_prob/(pv_prior_prob*posterior_prob + self.eps)
+                            for j in range(accept_probs.size(0)):
+                                rand_num = random.random()
+                                if rand_num<=accept_probs[j]:
+                                    # accept
+                                    accept_rate += 1
+                                    doc_idx[j, :] = z_idx[j, :]
+
+                        else:
+                            # directly accept
+                            doc_idx = z_idx.clone() # (B, 1)
                     else:
                         doc_idx = pv_doc_idx.clone()
                         lm_prob_ratio = torch.exp(pv_nl_lm_prob-nl_lm_prob)
@@ -959,7 +980,8 @@ class UnsupervisedModel(nn.Module):
                                 # accept
                                 accept_rate += 1
                                 doc_idx[j, :] = z_idx[j, :]
-
+                    
+                    final_z_ids[:, i] = doc_idx.squeeze(1)
                     
                     pv_posterior_prob = posterior_prob # previous posterior prob
                     pv_prior_prob = prior_prob
@@ -967,13 +989,34 @@ class UnsupervisedModel(nn.Module):
                     pv_doc_idx = doc_idx
             
             # calculate prob with gradient
-            log_prior_prob = torch.log(torch.gather(prior_prob_on_topk, 1, doc_idx).squeeze(1)+self.eps) # (B, )
+            if self.args.multi_sample_training:
+                # use all the samples on the MIS chain
+                doc_idx = final_z_ids # (B,1) --> (B,n)
+            if self.args.in_batch_neg:
+                # in batch negative sampling
+                final_embeddings = torch.gather(
+                    posterior_topk_documents_embeddings, 1, doc_idx.unsqueeze(-1).expand(batch_size, doc_idx.size(1), hidden_size)) # (B, n|1, H)
+                final_embeddings = final_embeddings.view(-1, hidden_size) # (B*n, H)
+                prior_similarities = prior_question_embeddings @ final_embeddings.T # (B, B*n) if not multi_sample_training then n=1
+                prior_in_batch_probs = F.softmax(prior_similarities, -1)
+                positive_idx = torch.arange(final_embeddings.size(0)).view(batch_size, -1).cuda() # (B, n)
+                prior_prob = torch.gather(prior_in_batch_probs, 1, positive_idx).sum(-1) # (B, n)
+                posterier_similarities = posterior_question_embeddings @ final_embeddings.T
+                posterior_in_batch_probs = F.softmax(posterier_similarities, -1)
+                posterior_prob = torch.gather(posterior_in_batch_probs, 1, positive_idx).sum(-1)
+            else:
+                # softmax in topk subspace
+                prior_prob = torch.gather(prior_prob_on_topk, 1, doc_idx).sum(-1) # (B,)
+                posterior_prob = topk_probs.gather(1, doc_idx).sum(-1)
 
             doc_text = self.SelectDoc(posterior_topk_documents_text, doc_idx)
-            input_ids, labels, _ = self.decoder_model._prepare_inputs(decoder_input_ids, decoder_response_ids, doc_text) # (B, 1, L)
-            _, neg_log_lm_prob = self.decoder_model.cal_prob(input_ids.squeeze(1).cuda(), labels.squeeze(1).cuda()) # (B, )
-
-            log_posterior_prob = torch.log(topk_probs.gather(1, doc_idx).squeeze(1)+self.eps) # (B, )
+            input_ids, labels, _ = self.decoder_model._prepare_inputs(decoder_input_ids, decoder_response_ids, doc_text) # (B, n|1, L)
+            _, neg_log_lm_prob = self.decoder_model.cal_prob(
+                input_ids.view(-1, input_ids.size(-1)).cuda(), labels.view(-1, labels.size(-1)).cuda()) # (B*n|1, )
+            if self.args.multi_sample_training:
+                neg_log_lm_prob = neg_log_lm_prob.view(batch_size, -1).sum(-1) # (B*n,)-->(B,n)-->(B,)
+            log_prior_prob = torch.log(prior_prob+self.eps) # (B, )
+            log_posterior_prob = torch.log(posterior_prob + self.eps) # (B, )
             loss = (-log_prior_prob + neg_log_lm_prob - log_posterior_prob).mean()
             log_info['accept_rate'] = accept_rate/((self.args.mis_step-1)*doc_idx.size(0))
             log_info['log_prior_prob'] = log_prior_prob.mean().item()
@@ -981,6 +1024,13 @@ class UnsupervisedModel(nn.Module):
             log_info['log_lm_prob'] = -neg_log_lm_prob.mean().item()
             log_info[f'prior_r{self.topk}'] = prior_recall
             log_info[f'posterior_r{self.topk}'] = posterior_recall
+            if self.args.jsa_cache:
+                batch['cached_ids'] = doc_idx.cpu()
+                batch['cached_probs'] = (
+                    prior_prob.detach().cpu(),
+                    neg_log_lm_prob.detach().cpu(),
+                    posterior_prob.detach().cpu()
+                )
 
 
         return loss, log_info

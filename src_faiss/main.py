@@ -29,6 +29,7 @@ def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
 
 def Train(args, train_dataset, eval_dataset, test_dataset, model, writer=None):
@@ -144,7 +145,7 @@ def Evaluate(args, eval_dataset, model):
              _,
              doc_ids,
              q_ids,
-             _) = batch
+             _) = batch.values()
 
             prior_logits, prior_indices, _ = model.module.prior_model(
                 prior_input_ids.cuda(), args.topk)
@@ -197,6 +198,9 @@ def main_worker(local_rank, args):
     if local_rank==0:
         if not os.path.exists(args.model_path):
             os.mkdir(args.model_path)
+        else:
+            shutil.rmtree(args.model_path)
+            os.mkdir(args.model_path)
         log_dir = os.path.join(args.model_path, 'log')
         if os.path.exists(log_dir):
             shutil.rmtree(log_dir)
@@ -232,7 +236,6 @@ def main_worker(local_rank, args):
 
     indexed_passages = KnowledgeWalker(args)
 
-    args.batch_size = args.batch_size * args.n_gpus
     model = UnsupervisedModel(args, indexed_passages)
     tokenizers = {
         "prior_tokenizer": model.prior_model.tokenizer,
@@ -314,6 +317,12 @@ def main():
                         help="MIS steps", default=10)
     parser.add_argument("--dist_url", type=str,
                         help="communication url for ddp training", default="tcp://localhost:13457")
+    parser.add_argument("--jsa_cache", action="store_true",
+                        help="use mcmc cache in jsa method")
+    parser.add_argument("--in_batch_neg", action="store_true",
+                        help="in batch negative sampling")
+    parser.add_argument("--multi_sample_training", action="store_true",
+                        help="multiple sample training")
     args = parser.parse_args()
     mp.spawn(main_worker, nprocs=args.n_gpus, args=(args,))
 
